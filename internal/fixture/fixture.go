@@ -38,6 +38,12 @@ func be32(v uint32) []byte {
 	return b[:]
 }
 
+func be16(v uint16) []byte {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], v)
+	return b[:]
+}
+
 func be64(v uint64) []byte {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], v)
@@ -151,6 +157,17 @@ type MediaOpts struct {
 	MdatTruncate  int    // shrink mdat payload by this many bytes
 	DataOffset    *int32 // explicit data_offset for the first trun
 	SecondOverlap uint32 // shift second trun's data_offset back by this many bytes
+
+	Sidx          bool    // prepend a top-level sidx box before the moof
+	SidxVersion   byte    // sidx version (0 or 1); default 0
+	SidxTimescale uint32  // sidx timescale; 0 -> 48000
+	SidxEarliest  *uint64 // earliest_presentation_time; default BaseTime
+	SidxDuration  *uint32 // subsegment_duration; default total sample duration
+	SidxRefSize   *uint32 // referenced_size; default moof+mdat byte count
+	SidxFirstOff  uint64  // first_offset; default 0
+	SidxRefCount  uint16  // reference_count; default 1 (extra entries are zeroed)
+	SidxRefType   uint32  // reference_type of the first reference; default 0 (media)
+	SidxDouble    bool    // emit a second, identical sidx box
 }
 
 // MediaSegment builds an fMP4 media segment: styp, moof(mfhd, traf(tfhd,
@@ -235,8 +252,68 @@ func MediaSegment(o MediaOpts) []byte {
 		mdat = Box("mdat", payload)
 	}
 
+	var sidx []byte
+	if o.Sidx {
+		sidx = buildSidx(o, uint32(len(moof)+len(mdat)))
+		if o.SidxDouble {
+			sidx = cat(sidx, sidx)
+		}
+	}
+
 	styp := Box("styp", cat([]byte("msdh"), be32(0), []byte("msdhmsix")))
-	return cat(styp, moof, mdat)
+	return cat(styp, sidx, moof, mdat)
+}
+
+// buildSidx builds a top-level Segment Index box. refSize is the correct
+// moof+mdat byte count computed by the caller; the pointer fields of
+// MediaOpts let tests deliberately misdeclare the index.
+func buildSidx(o MediaOpts, refSize uint32) []byte {
+	timescale := o.SidxTimescale
+	if timescale == 0 {
+		timescale = 48000
+	}
+	earliest := o.BaseTime
+	if o.SidxEarliest != nil {
+		earliest = *o.SidxEarliest
+	}
+	duration := uint32(totalDur(o.Samples) + totalDur(o.SecondTrun))
+	if o.SidxDuration != nil {
+		duration = *o.SidxDuration
+	}
+	if o.SidxRefSize != nil {
+		refSize = *o.SidxRefSize
+	}
+	refCount := o.SidxRefCount
+	if refCount == 0 {
+		refCount = 1
+	}
+
+	body := cat(be32(o.TrackID), be32(timescale))
+	if o.SidxVersion == 1 {
+		body = cat(body, be64(earliest), be64(o.SidxFirstOff))
+	} else {
+		body = cat(body, be32(uint32(earliest)), be32(uint32(o.SidxFirstOff)))
+	}
+	body = cat(body, be16(0), be16(refCount)) // reserved, reference_count
+	for i := 0; i < int(refCount); i++ {
+		if i == 0 {
+			body = cat(body,
+				be32(o.SidxRefType<<31|refSize),
+				be32(duration),
+				be32(0x80000000)) // starts_with_SAP=1, SAP_type=0, SAP_delta_time=0
+		} else {
+			body = cat(body, make([]byte, 12))
+		}
+	}
+	return fullBox("sidx", o.SidxVersion, 0, body)
+}
+
+func totalDur(samples []Sample) int {
+	n := 0
+	for _, s := range samples {
+		n += int(s.Dur)
+	}
+	return n
 }
 
 func totalSize(samples []Sample) int {

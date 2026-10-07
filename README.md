@@ -10,7 +10,7 @@
 # 构建并启动 API（宿主机端口默认 8080，可用 API_PORT 覆盖）
 API_PORT=9000 docker compose up -d api
 
-# 一次性验证：等待 API 健康后执行单元测试、构建检查、连续/断裂时间线 HTTP 冒烟，
+# 一次性验证：等待 API 健康后执行单元测试、构建检查、时间线与 sidx 索引 HTTP 冒烟，
 # 以退出码报告结果（0 = 全部通过）
 docker compose up --exit-code-from verify --abort-on-container-exit verify
 echo "verify exit code: $?"
@@ -45,6 +45,42 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 - 采样时长/大小按 `trun` → `tfhd` → `trex` 继承且可解析；
 - 每个 `trun` 的载荷区间落在本片段 `mdat` 内、互不重叠、且 `mdat` 字节被完全消费；
 - 相邻片段的解码区间**精确衔接**（`next.start == prev.end`，无空洞、无重叠）。
+
+#### 可选查询参数 `index=sidx`
+
+归档平台会把媒体分片连同片内 `sidx` 交给按索引取数的审听节点。附加 `index=sidx`
+后，除上述时间线审计外，每个媒体 part 还须通过索引一致性校验：
+
+- 恰好一个**顶层** `sidx` 盒；
+- `sidx.timescale` 与音轨 `mdhd` 时标一致；
+- 仅含一个**媒体引用**（`reference_count` = 1 且 `reference_type` = 0）；
+- `first_offset` 为 0，引用范围（`referenced_size`）精确覆盖 `sidx` 之后的全部
+  `moof`/`mdat` 字节；
+- 声明的 `subsegment_duration` 与 `earliest_presentation_time` 分别等于该 part
+  由 `tfdt`/`trun` 重建的实际解码时长与起点。
+
+省略该参数时接纳范围、响应字段与错误语义完全不变（`sidx` 盒被忽略）；取其他值
+一律以 `400 BAD_INDEX_MODE` 拒绝。
+
+索引模式的成功响应额外携带各媒体 part 的索引事实（`segments` 仅在启用时出现）：
+
+```json
+{
+  "ok": true,
+  "timescale": 48000,
+  "trackId": 1,
+  "fragmentCount": 2,
+  "totalDuration": 6144,
+  "fragments": [ ... ],
+  "segments": [
+    {"index": 0, "indexStart": 0,    "indexDuration": 3072, "referencedBytes": 168},
+    {"index": 1, "indexStart": 3072, "indexDuration": 3072, "referencedBytes": 168}
+  ]
+}
+```
+
+索引结构、范围或时间不符时返回 `422`，错误体携带对应 part 的 0 基序号
+（`segmentIndex`，`fragmentIndex` 为 `-1`）与下表中的稳定错误码。
 
 #### 成功响应 `200 OK`
 
@@ -112,6 +148,13 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 | `PAYLOAD_NOT_CONSUMED` | 422 | mdat 存在未被引用的字节 |
 | `TIMELINE_GAP` | 422 | 相邻解码区间存在空洞 |
 | `TIMELINE_OVERLAP` | 422 | 相邻解码区间存在重叠 |
+| `BAD_INDEX_MODE` | 400 | `index` 查询参数取值不是 `sidx` |
+| `MISSING_SIDX` | 422 | 索引模式下媒体 part 缺少顶层 `sidx` |
+| `MULTI_SIDX_UNSUPPORTED` | 422 | 媒体 part 含多个顶层 `sidx` |
+| `SIDX_TIMESCALE_MISMATCH` | 422 | `sidx` 时标与音轨时标不一致 |
+| `SIDX_REFERENCE_INVALID` | 422 | `sidx` 引用数不为 1 或引用非媒体引用 |
+| `SIDX_RANGE_MISMATCH` | 422 | `first_offset` 非 0 或引用范围未精确覆盖其后 `moof`/`mdat` |
+| `SIDX_TIME_MISMATCH` | 422 | `sidx` 声明的起点/时长与该 part 实际解码区间不符 |
 
 ## 交付结构
 
@@ -119,12 +162,13 @@ part 字段名不限，顺序即语义。所有 part 合计不得超过 **16 MiB
 Dockerfile            # 多阶段：build / runtime(scratch) / verify
 docker-compose.yml    # api（健康检查、API_PORT 可配宿主机端口）+ verify（一次性）
 cmd/server            # API 服务（含 healthcheck 子命令）
-cmd/smoke             # HTTP 冒烟客户端（连续 + 断裂时间线）
+cmd/smoke             # HTTP 冒烟客户端（连续/断裂时间线 + sidx 索引模式）
 internal/fmp4         # ISO BMFF 解析与审计逻辑
 internal/fixture      # 测试用 fMP4 构造器（单测与冒烟共用）
 scripts/verify.sh     # verify 服务入口：go test → vet/build → 等待健康 → 冒烟
 ```
 
 `verify` 服务通过 `depends_on: service_healthy` 等待 API 健康，随后执行
-`go test ./...`、`go vet ./...`、`go build`，再对活动 API 跑连续与断裂时间线的
-HTTP 冒烟，全部通过以退出码 0 结束，任一失败以非 0 结束。
+`go test ./...`、`go vet ./...`、`go build`，再对活动 API 跑 HTTP 冒烟：旧请求
+（连续/断裂时间线、载荷缺陷）、合法 `sidx` 索引上传，以及索引范围/时间声明
+不符与非法索引模式的拒收。全部通过以退出码 0 结束，任一失败以非 0 结束。

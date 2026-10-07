@@ -1,6 +1,7 @@
 // Command smoke runs HTTP smoke tests against a live audit API: it submits
-// a continuous timeline (expecting success) and several broken timelines
-// (expecting the matching stable error codes).
+// a continuous timeline (expecting success), several broken timelines
+// (expecting the matching stable error codes), and exercises the optional
+// index=sidx audit stage with valid and misdeclared sidx boxes.
 //
 // Usage: smoke -url http://127.0.0.1:8080
 package main
@@ -42,6 +43,12 @@ type auditResponse struct {
 		Duration       uint64 `json:"duration"`
 		Samples        uint32 `json:"samples"`
 	} `json:"fragments"`
+	Segments []struct {
+		Index           int    `json:"index"`
+		IndexStart      uint64 `json:"indexStart"`
+		IndexDuration   uint64 `json:"indexDuration"`
+		ReferencedBytes uint32 `json:"referencedBytes"`
+	} `json:"segments"`
 	Error *errorBody `json:"error"`
 }
 
@@ -57,6 +64,7 @@ func main() {
 	checkContinuous(client, *url)
 	checkBrokenTimelines(client, *url)
 	checkBrokenPayloads(client, *url)
+	checkSidxMode(client, *url)
 
 	if failures > 0 {
 		fmt.Printf("SMOKE FAILED: %d check(s) failed\n", failures)
@@ -196,11 +204,110 @@ func checkBrokenPayloads(client *http.Client, base string) {
 		422, "SAMPLE_DURATION_UNRESOLVABLE", 0, 0, bareInit, noDur)
 }
 
+// checkSidxMode exercises the optional index=sidx audit stage: a valid
+// indexed upload, unchanged legacy behaviour, a bad mode value, and sidx
+// range/time misdeclarations.
+func checkSidxMode(client *http.Client, base string) {
+	init := fixture.InitSegment(fixture.InitOpts{
+		Timescale: 48000, TrackID: 1, TrexDuration: 1024, TrexSize: 16,
+	})
+	mk := func(seq uint32, t uint64) []byte {
+		return fixture.MediaSegment(fixture.MediaOpts{
+			Seq: seq, BaseTime: t, Samples: fixture.Samples(3, 1024, 16), Sidx: true,
+		})
+	}
+	seg1, seg2 := mk(1, 0), mk(2, 3072)
+
+	fmt.Println("[index] valid sidx index across 2 segments")
+	status, body, err := postAuditQuery(client, base, "index=sidx", init, seg1, seg2)
+	if err != nil {
+		fail("post: %v", err)
+	} else if status != http.StatusOK || !body.OK {
+		fail("status %d ok=%v, want 200 ok=true (error=%+v)", status, body.OK, body.Error)
+	} else if len(body.Segments) != 2 {
+		fail("segments len %d, want 2", len(body.Segments))
+	} else {
+		wantStart := []uint64{0, 3072}
+		wantBytes := []uint32{mediaTailBytes(seg1), mediaTailBytes(seg2)}
+		ok := true
+		for i, s := range body.Segments {
+			if s.Index != i || s.IndexStart != wantStart[i] ||
+				s.IndexDuration != 3072 || s.ReferencedBytes != wantBytes[i] {
+				fail("segment %d = %+v, unexpected", i, s)
+				ok = false
+				break
+			}
+		}
+		if ok {
+			pass("indexed upload accepted, per-part index start/duration/bytes reported")
+		}
+	}
+
+	fmt.Println("[index] legacy request ignores sidx boxes")
+	status, body, err = postAudit(client, base, init, seg1, seg2)
+	if err != nil {
+		fail("post: %v", err)
+	} else if status != http.StatusOK || !body.OK || len(body.Segments) != 0 {
+		fail("status %d ok=%v segments=%d, want 200 ok=true without index facts",
+			status, body.OK, len(body.Segments))
+	} else {
+		pass("legacy request accepted without index facts")
+	}
+
+	expectErrorQuery(client, base, "unsupported index mode value",
+		http.StatusBadRequest, "BAD_INDEX_MODE", -1, -1, "index=smix", init, seg1)
+
+	plain2 := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 2, BaseTime: 3072, Samples: fixture.Samples(3, 1024, 16),
+	})
+	expectErrorQuery(client, base, "second media part has no sidx",
+		422, "MISSING_SIDX", 1, -1, "index=sidx", init, seg1, plain2)
+
+	small := uint32(8)
+	badSize := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 2, BaseTime: 3072, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxRefSize: &small,
+	})
+	expectErrorQuery(client, base, "sidx referenced_size does not cover moof/mdat",
+		422, "SIDX_RANGE_MISMATCH", 1, -1, "index=sidx", init, seg1, badSize)
+
+	badDur := uint32(4096)
+	wrongDur := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 2, BaseTime: 3072, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxDuration: &badDur,
+	})
+	expectErrorQuery(client, base, "sidx duration does not match decode interval",
+		422, "SIDX_TIME_MISMATCH", 1, -1, "index=sidx", init, seg1, wrongDur)
+
+	badStart := uint64(1024)
+	wrongStart := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 2, BaseTime: 3072, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxEarliest: &badStart,
+	})
+	expectErrorQuery(client, base, "sidx earliest time does not match decode start",
+		422, "SIDX_TIME_MISMATCH", 1, -1, "index=sidx", init, seg1, wrongStart)
+}
+
+// mediaTailBytes returns the moof+mdat byte count of a fixture segment
+// (fixture layout: styp, sidx?, moof, mdat).
+func mediaTailBytes(seg []byte) uint32 {
+	i := bytes.Index(seg, []byte("moof"))
+	if i < 4 {
+		return 0
+	}
+	return uint32(len(seg) - (i - 4))
+}
+
 // expectError posts init+segs and requires the given status, error code and
 // error indices.
 func expectError(client *http.Client, base, name string, wantStatus int, wantCode string, wantSeg, wantFrag int, init []byte, segs ...[]byte) {
+	expectErrorQuery(client, base, name, wantStatus, wantCode, wantSeg, wantFrag, "", init, segs...)
+}
+
+// expectErrorQuery is expectError with an explicit query string.
+func expectErrorQuery(client *http.Client, base, name string, wantStatus int, wantCode string, wantSeg, wantFrag int, query string, init []byte, segs ...[]byte) {
 	fmt.Printf("[reject] %s\n", name)
-	status, body, err := postAudit(client, base, init, segs...)
+	status, body, err := postAuditQuery(client, base, query, init, segs...)
 	if err != nil {
 		fail("post: %v", err)
 		return
@@ -224,6 +331,11 @@ func expectError(client *http.Client, base, name string, wantStatus int, wantCod
 // postAudit uploads one init segment and the given media segments as ordered
 // multipart parts and decodes the JSON response.
 func postAudit(client *http.Client, base string, init []byte, segs ...[]byte) (int, *auditResponse, error) {
+	return postAuditQuery(client, base, "", init, segs...)
+}
+
+// postAuditQuery is postAudit with an explicit query string.
+func postAuditQuery(client *http.Client, base, query string, init []byte, segs ...[]byte) (int, *auditResponse, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	writePart := func(name, filename string, data []byte) error {
@@ -249,7 +361,11 @@ func postAudit(client *http.Client, base string, init []byte, segs ...[]byte) (i
 		return 0, nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, base+"/api/fmp4/audit", &buf)
+	url := base + "/api/fmp4/audit"
+	if query != "" {
+		url += "?" + query
+	}
+	req, err := http.NewRequest(http.MethodPost, url, &buf)
 	if err != nil {
 		return 0, nil, err
 	}

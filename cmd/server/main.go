@@ -95,6 +95,8 @@ type okResponse struct {
 	FragmentCount int                   `json:"fragmentCount"`
 	TotalDuration uint64                `json:"totalDuration"`
 	Fragments     []fmp4.FragmentReport `json:"fragments"`
+	// Segments is only present when the sidx index mode was requested.
+	Segments []fmp4.SegmentReport `json:"segments,omitempty"`
 }
 
 type errResponse struct {
@@ -110,6 +112,22 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 			SegmentIndex: -1, FragmentIndex: -1,
 		})
 		return
+	}
+
+	// Optional audit stages are selected with the "index" query parameter.
+	// Omitting it keeps the classic audit; any value other than "sidx" is
+	// rejected before the body is read.
+	indexSidx := false
+	if values, present := r.URL.Query()["index"]; present {
+		if len(values) != 1 || values[0] != "sidx" {
+			writeError(w, http.StatusBadRequest, &fmp4.AuditError{
+				Code:         fmp4.CodeBadIndexMode,
+				Message:      `unsupported index mode: only "sidx" is accepted`,
+				SegmentIndex: -1, FragmentIndex: -1,
+			})
+			return
+		}
+		indexSidx = true
 	}
 
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -188,7 +206,7 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rep, aerr := fmp4.Audit(init, segs)
+	rep, aerr := fmp4.AuditWithOptions(init, segs, fmp4.Options{IndexSidx: indexSidx})
 	if aerr != nil {
 		writeError(w, http.StatusUnprocessableEntity, aerr)
 		return
@@ -200,6 +218,7 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		FragmentCount: rep.FragmentCount,
 		TotalDuration: rep.TotalDuration,
 		Fragments:     rep.Fragments,
+		Segments:      rep.Segments,
 	})
 }
 

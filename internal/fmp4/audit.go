@@ -26,6 +26,15 @@ type FragmentReport struct {
 	Samples        uint32 `json:"samples"`
 }
 
+// SegmentReport carries the validated sidx facts of one media segment. It is
+// only populated when sidx index mode was requested (see Options).
+type SegmentReport struct {
+	Index           int    `json:"index"`
+	IndexStart      uint64 `json:"indexStart"`
+	IndexDuration   uint64 `json:"indexDuration"`
+	ReferencedBytes uint32 `json:"referencedBytes"`
+}
+
 // Report is the result of a successful audit.
 type Report struct {
 	Timescale     uint32
@@ -33,6 +42,9 @@ type Report struct {
 	FragmentCount int
 	TotalDuration uint64
 	Fragments     []FragmentReport
+	// Segments holds one entry per media segment, but only when sidx index
+	// mode was requested; it is nil otherwise.
+	Segments []SegmentReport
 }
 
 // initTrack carries the per-track facts recovered from the init segment.
@@ -52,22 +64,41 @@ type fragment struct {
 	samples      uint32
 }
 
+// Options toggles optional audit stages. The zero value reproduces the
+// classic audit exactly.
+type Options struct {
+	// IndexSidx requires every media segment to carry exactly one top-level
+	// sidx box whose single media reference starts right after the box
+	// (first_offset 0), exactly covers the moof/mdat bytes that follow it,
+	// and declares the segment's actual decode interval.
+	IndexSidx bool
+}
+
 // Audit validates one initialization segment followed by one or more media
 // segments and returns the reconstructed decode timeline. Any violation is
 // reported as a single *AuditError with a stable code.
 func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
+	return AuditWithOptions(initBuf, segs, Options{})
+}
+
+// AuditWithOptions is Audit with optional extra audit stages.
+func AuditWithOptions(initBuf []byte, segs [][]byte, opts Options) (*Report, *AuditError) {
 	init, aerr := parseInit(initBuf)
 	if aerr != nil {
 		return nil, aerr
 	}
 
 	var frags []fragment
+	var segReps []SegmentReport
 	for i, seg := range segs {
-		fs, aerr := parseMediaSegment(seg, i, init, len(frags))
+		fs, srep, aerr := parseMediaSegment(seg, i, init, len(frags), opts.IndexSidx)
 		if aerr != nil {
 			return nil, aerr
 		}
 		frags = append(frags, fs...)
+		if srep != nil {
+			segReps = append(segReps, *srep)
+		}
 	}
 
 	// Cross-fragment ordering and exact decode-timeline continuity.
@@ -95,6 +126,7 @@ func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
 		Timescale:     init.timescale,
 		TrackID:       init.trackID,
 		FragmentCount: len(frags),
+		Segments:      segReps,
 	}
 	for i, f := range frags {
 		rep.Fragments = append(rep.Fragments, FragmentReport{
@@ -295,15 +327,16 @@ func parseTrex(b *box) (trackID, defDur, defSize uint32, aerr *AuditError) {
 // parseMediaSegment audits one media segment: every moof must describe the
 // init segment's track, resolve all sample parameters, and reference payload
 // bytes that exist inside the segment's mdat box(es). fragBase is the global
-// fragment index of the segment's first moof.
-func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([]fragment, *AuditError) {
+// fragment index of the segment's first moof. When indexSidx is set, the
+// segment's top-level sidx is validated as well and its facts are returned.
+func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int, indexSidx bool) ([]fragment, *SegmentReport, *AuditError) {
 	tops, aerr := parseBoxes(buf, 0, segIdx, fragBase)
 	if aerr != nil {
-		return nil, aerr
+		return nil, nil, aerr
 	}
 	moofs := findBoxes(tops, "moof")
 	if len(moofs) == 0 {
-		return nil, errf(CodeMissingMoof, segIdx, fragBase,
+		return nil, nil, errf(CodeMissingMoof, segIdx, fragBase,
 			"media segment %d contains no moof box", segIdx)
 	}
 	mdats := findBoxes(tops, "mdat")
@@ -313,7 +346,7 @@ func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([
 	for i := range moofs {
 		f, rs, aerr := parseMoof(&moofs[i], segIdx, fragBase+i, init)
 		if aerr != nil {
-			return nil, aerr
+			return nil, nil, aerr
 		}
 		frags = append(frags, *f)
 		ranges = append(ranges, rs...)
@@ -322,9 +355,16 @@ func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([
 	// every moof must land inside an mdat of this segment, ranges must not
 	// overlap, and the mdat payload bytes must be fully consumed.
 	if aerr := checkPayload(ranges, mdats, segIdx); aerr != nil {
-		return nil, aerr
+		return nil, nil, aerr
 	}
-	return frags, nil
+	var srep *SegmentReport
+	if indexSidx {
+		srep, aerr = checkSidx(tops, segIdx, init, frags)
+		if aerr != nil {
+			return nil, nil, aerr
+		}
+	}
+	return frags, srep, nil
 }
 
 // payloadRange is one trun's media byte extent inside a segment.
@@ -659,4 +699,163 @@ func checkPayload(ranges []payloadRange, mdats []box, seg int) *AuditError {
 		}
 	}
 	return nil
+}
+
+// sidxInfo carries the fields of a SegmentIndexBox that the index audit
+// relies on (ISO/IEC 14496-12).
+type sidxInfo struct {
+	timescale      uint32
+	earliest       uint64
+	firstOffset    uint64
+	refCount       uint16
+	refIsMedia     bool
+	referencedSize uint32
+	subsegDuration uint32
+}
+
+// parseSidx decodes one top-level sidx box of a media segment.
+func parseSidx(b *box, seg int) (*sidxInfo, *AuditError) {
+	version, _, body, aerr := fullBox(b, seg, -1)
+	if aerr != nil {
+		return nil, aerr
+	}
+	c := &cursor{b: body}
+	if _, ok := c.u32(); !ok { // reference_ID
+		return nil, errf(CodeBoxStructureInvalid, seg, -1, "sidx truncated at reference_ID")
+	}
+	ts, ok := c.u32()
+	if !ok {
+		return nil, errf(CodeBoxStructureInvalid, seg, -1, "sidx truncated at timescale")
+	}
+	info := &sidxInfo{timescale: ts}
+	switch version {
+	case 0:
+		e, ok1 := c.u32()
+		f, ok2 := c.u32()
+		if !ok1 || !ok2 {
+			return nil, errf(CodeBoxStructureInvalid, seg, -1,
+				"sidx v0 truncated at earliest_presentation_time/first_offset")
+		}
+		info.earliest, info.firstOffset = uint64(e), uint64(f)
+	case 1:
+		e, ok1 := c.u64()
+		f, ok2 := c.u64()
+		if !ok1 || !ok2 {
+			return nil, errf(CodeBoxStructureInvalid, seg, -1,
+				"sidx v1 truncated at earliest_presentation_time/first_offset")
+		}
+		info.earliest, info.firstOffset = e, f
+	default:
+		return nil, errf(CodeBoxStructureInvalid, seg, -1, "unsupported sidx version %d", version)
+	}
+	if !c.skip(2) { // reserved
+		return nil, errf(CodeBoxStructureInvalid, seg, -1, "sidx truncated at reserved field")
+	}
+	rc, ok := c.u16()
+	if !ok {
+		return nil, errf(CodeBoxStructureInvalid, seg, -1, "sidx truncated at reference_count")
+	}
+	info.refCount = rc
+	for i := 0; i < int(rc); i++ {
+		v, ok1 := c.u32() // reference_type(1) | referenced_size(31)
+		d, ok2 := c.u32() // subsegment_duration
+		if !ok1 || !ok2 || !c.skip(4) {
+			return nil, errf(CodeBoxStructureInvalid, seg, -1, "sidx truncated at reference %d", i)
+		}
+		if i == 0 {
+			info.refIsMedia = v>>31 == 0
+			info.referencedSize = v & 0x7fffffff
+			info.subsegDuration = d
+		}
+	}
+	return info, nil
+}
+
+// checkSidx validates the segment's single top-level sidx against the
+// segment's actual box layout and decode interval, and returns the index
+// facts reported back to the archivist. frags are the segment's audited
+// fragments in decode order.
+func checkSidx(tops []box, segIdx int, init *initTrack, frags []fragment) (*SegmentReport, *AuditError) {
+	sidxs := findBoxes(tops, "sidx")
+	if len(sidxs) == 0 {
+		return nil, errf(CodeMissingSidx, segIdx, -1,
+			"media segment %d has no top-level sidx box", segIdx)
+	}
+	if len(sidxs) > 1 {
+		return nil, errf(CodeMultiSidx, segIdx, -1,
+			"media segment %d has %d top-level sidx boxes; exactly one is required",
+			segIdx, len(sidxs))
+	}
+	sidx := sidxs[0]
+	info, aerr := parseSidx(&sidx, segIdx)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if info.timescale != init.timescale {
+		return nil, errf(CodeSidxTimescaleMismatch, segIdx, -1,
+			"sidx timescale %d does not match audio track timescale %d",
+			info.timescale, init.timescale)
+	}
+	if info.refCount != 1 {
+		return nil, errf(CodeSidxReferenceInvalid, segIdx, -1,
+			"sidx has %d references; exactly one media reference is required", info.refCount)
+	}
+	if !info.refIsMedia {
+		return nil, errf(CodeSidxReferenceInvalid, segIdx, -1,
+			"sidx reference is not a media reference (reference_type=1)")
+	}
+
+	// The referenced byte range starts at the end of the sidx box
+	// (first_offset is relative to it) and must exactly cover every
+	// moof/mdat byte that follows the sidx.
+	if info.firstOffset != 0 {
+		return nil, errf(CodeSidxRangeMismatch, segIdx, -1,
+			"sidx first_offset is %d, must be 0", info.firstOffset)
+	}
+	sidxEnd := sidx.start + sidx.size
+	refEnd := sidxEnd + int64(info.referencedSize)
+	var mediaBytes int64
+	for _, b := range tops {
+		if b.start < sidxEnd {
+			continue // the sidx itself and anything before it
+		}
+		isMedia := b.typ == "moof" || b.typ == "mdat"
+		if isMedia {
+			mediaBytes += b.size
+		}
+		if !isMedia && b.start < refEnd {
+			return nil, errf(CodeSidxRangeMismatch, segIdx, -1,
+				"sidx reference range covers non-moof/mdat box %q at offset %d", b.typ, b.start)
+		}
+	}
+	if int64(info.referencedSize) != mediaBytes {
+		return nil, errf(CodeSidxRangeMismatch, segIdx, -1,
+			"sidx references %d byte(s) but %d moof/mdat byte(s) follow the sidx",
+			info.referencedSize, mediaBytes)
+	}
+
+	// The declared time interval must match the segment's actual decode
+	// interval reconstructed from tfdt/trun.
+	start := frags[0].start
+	var dur uint64
+	for _, f := range frags {
+		dur += f.duration
+	}
+	if info.earliest != start {
+		return nil, errf(CodeSidxTimeMismatch, segIdx, -1,
+			"sidx earliest_presentation_time %d does not match segment decode start %d",
+			info.earliest, start)
+	}
+	if uint64(info.subsegDuration) != dur {
+		return nil, errf(CodeSidxTimeMismatch, segIdx, -1,
+			"sidx subsegment_duration %d does not match segment decode duration %d",
+			info.subsegDuration, dur)
+	}
+
+	return &SegmentReport{
+		Index:           segIdx,
+		IndexStart:      info.earliest,
+		IndexDuration:   uint64(info.subsegDuration),
+		ReferencedBytes: info.referencedSize,
+	}, nil
 }

@@ -1,6 +1,7 @@
 package fmp4
 
 import (
+	"bytes"
 	"testing"
 
 	"fmp4audit/internal/fixture"
@@ -255,4 +256,193 @@ func TestAuditMissingTrex(t *testing.T) {
 	}
 	init[idx] = 9 // track_ID 1 -> 9
 	expectCode(t, init, [][]byte{goodSeg(1, 0)}, CodeMissingTrex, -1, -1)
+}
+
+// goodSidxSeg builds a media segment carrying a correct top-level sidx.
+func goodSidxSeg(seq uint32, t uint64) []byte {
+	return fixture.MediaSegment(fixture.MediaOpts{
+		Seq: seq, BaseTime: t, Samples: fixture.Samples(3, 1024, 16), Sidx: true,
+	})
+}
+
+// mediaTail returns the segment bytes from the moof box onward.
+func mediaTail(t *testing.T, seg []byte) []byte {
+	t.Helper()
+	i := bytes.Index(seg, []byte("moof"))
+	if i < 4 {
+		t.Fatal("moof box not found in fixture segment")
+	}
+	return seg[i-4:]
+}
+
+// expectCodeOpts audits with options and requires the given error code and
+// indices.
+func expectCodeOpts(t *testing.T, opts Options, init []byte, segs [][]byte, code string, seg, frag int) {
+	t.Helper()
+	_, aerr := AuditWithOptions(init, segs, opts)
+	if aerr == nil {
+		t.Fatalf("expected %s, got success", code)
+	}
+	if aerr.Code != code {
+		t.Fatalf("expected %s, got %s (%s)", code, aerr.Code, aerr.Message)
+	}
+	if aerr.SegmentIndex != seg || aerr.FragmentIndex != frag {
+		t.Fatalf("expected indices %d/%d, got %d/%d",
+			seg, frag, aerr.SegmentIndex, aerr.FragmentIndex)
+	}
+}
+
+func TestAuditSidxValid(t *testing.T) {
+	seg1, seg2 := goodSidxSeg(1, 0), goodSidxSeg(2, 3072)
+	rep, aerr := AuditWithOptions(goodInit(), [][]byte{seg1, seg2}, Options{IndexSidx: true})
+	if aerr != nil {
+		t.Fatalf("unexpected error: %+v", aerr)
+	}
+	if len(rep.Segments) != 2 {
+		t.Fatalf("segments=%d, want 2", len(rep.Segments))
+	}
+	wantStart := []uint64{0, 3072}
+	wantBytes := []uint32{
+		uint32(len(mediaTail(t, seg1))),
+		uint32(len(mediaTail(t, seg2))),
+	}
+	for i, s := range rep.Segments {
+		if s.Index != i || s.IndexStart != wantStart[i] ||
+			s.IndexDuration != 3072 || s.ReferencedBytes != wantBytes[i] {
+			t.Fatalf("segment %d: %+v", i, s)
+		}
+	}
+}
+
+func TestAuditSidxVersion1(t *testing.T) {
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxVersion: 1,
+	})
+	rep, aerr := AuditWithOptions(goodInit(), [][]byte{seg}, Options{IndexSidx: true})
+	if aerr != nil {
+		t.Fatalf("unexpected error: %+v", aerr)
+	}
+	if rep.Segments[0].IndexDuration != 3072 {
+		t.Fatalf("segment: %+v", rep.Segments[0])
+	}
+}
+
+func TestAuditSidxMultiMoofSegment(t *testing.T) {
+	// One media part whose two moofs are covered by a single sidx.
+	p1, p2 := goodSeg(1, 0), goodSeg(2, 3072)
+	media := append(mediaTail(t, p1), mediaTail(t, p2)...)
+	refSize := uint32(len(media))
+	dur := uint32(6144)
+	head := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxRefSize: &refSize, SidxDuration: &dur,
+	})
+	i := bytes.Index(head, []byte("moof")) - 4
+	seg := append(head[:i], media...)
+
+	rep, aerr := AuditWithOptions(goodInit(), [][]byte{seg}, Options{IndexSidx: true})
+	if aerr != nil {
+		t.Fatalf("unexpected error: %+v", aerr)
+	}
+	if rep.FragmentCount != 2 || len(rep.Segments) != 1 {
+		t.Fatalf("fragments=%d segments=%d", rep.FragmentCount, len(rep.Segments))
+	}
+	s := rep.Segments[0]
+	if s.IndexStart != 0 || s.IndexDuration != 6144 || s.ReferencedBytes != refSize {
+		t.Fatalf("segment: %+v", s)
+	}
+}
+
+func TestAuditSidxLegacyIgnoresSidx(t *testing.T) {
+	// Without index mode the sidx box is just another top-level box: the
+	// classic audit accepts the segments and reports no index facts.
+	rep, aerr := Audit(goodInit(), [][]byte{goodSidxSeg(1, 0), goodSidxSeg(2, 3072)})
+	if aerr != nil {
+		t.Fatalf("unexpected error: %+v", aerr)
+	}
+	if rep.Segments != nil {
+		t.Fatalf("legacy audit reported segments: %+v", rep.Segments)
+	}
+}
+
+func TestAuditSidxMissing(t *testing.T) {
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(),
+		[][]byte{goodSidxSeg(1, 0), goodSeg(2, 3072)},
+		CodeMissingSidx, 1, -1)
+}
+
+func TestAuditSidxDouble(t *testing.T) {
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxDouble: true,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeMultiSidx, 0, -1)
+}
+
+func TestAuditSidxTimescaleMismatch(t *testing.T) {
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxTimescale: 44100,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeSidxTimescaleMismatch, 0, -1)
+}
+
+func TestAuditSidxReferenceCount(t *testing.T) {
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxRefCount: 2,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeSidxReferenceInvalid, 0, -1)
+}
+
+func TestAuditSidxReferenceNotMedia(t *testing.T) {
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxRefType: 1,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeSidxReferenceInvalid, 0, -1)
+}
+
+func TestAuditSidxFirstOffset(t *testing.T) {
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxFirstOff: 8,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeSidxRangeMismatch, 0, -1)
+}
+
+func TestAuditSidxReferencedSizeMismatch(t *testing.T) {
+	small := uint32(8)
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxRefSize: &small,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeSidxRangeMismatch, 0, -1)
+}
+
+func TestAuditSidxEarliestMismatch(t *testing.T) {
+	early := uint64(1024)
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxEarliest: &early,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeSidxTimeMismatch, 0, -1)
+}
+
+func TestAuditSidxDurationMismatch(t *testing.T) {
+	dur := uint32(4096)
+	seg := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: true, SidxDuration: &dur,
+	})
+	expectCodeOpts(t, Options{IndexSidx: true}, goodInit(), [][]byte{seg},
+		CodeSidxTimeMismatch, 0, -1)
 }

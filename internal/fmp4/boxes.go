@@ -109,6 +109,15 @@ type cursor struct {
 	off int
 }
 
+func (c *cursor) u16() (uint16, bool) {
+	if c.off+2 > len(c.b) {
+		return 0, false
+	}
+	v := binary.BigEndian.Uint16(c.b[c.off:])
+	c.off += 2
+	return v, true
+}
+
 func (c *cursor) u32() (uint32, bool) {
 	if c.off+4 > len(c.b) {
 		return 0, false
