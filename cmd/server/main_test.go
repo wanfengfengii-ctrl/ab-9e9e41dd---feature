@@ -42,7 +42,12 @@ func buildMultipart(t *testing.T, init []byte, segs ...[]byte) (body *bytes.Buff
 
 func post(t *testing.T, body *bytes.Buffer, contentType string) (int, map[string]any) {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/fmp4/audit", body)
+	return postPath(t, "/api/fmp4/audit", body, contentType)
+}
+
+func postPath(t *testing.T, target string, body *bytes.Buffer, contentType string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, body)
 	req.Header.Set("Content-Type", contentType)
 	rec := httptest.NewRecorder()
 	routes().ServeHTTP(rec, req)
@@ -165,11 +170,128 @@ func TestHandlerPayloadTooLarge(t *testing.T) {
 	}
 }
 
+func goodSidxSeg(seq uint32, tm uint64) []byte {
+	return fixture.MediaSegment(fixture.MediaOpts{
+		Seq: seq, BaseTime: tm, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: &fixture.SidxOpts{},
+	})
+}
+
 func TestHandlerHealth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
+	}
+}
+
+func TestHandlerSidxOK(t *testing.T) {
+	body, ct := buildMultipart(t, goodInit(),
+		goodSidxSeg(1, 0), goodSidxSeg(2, 3072), goodSidxSeg(3, 6144))
+	status, resp := postPath(t, "/api/fmp4/audit?index=sidx", body, ct)
+	if status != http.StatusOK {
+		t.Fatalf("status %d, resp %v", status, resp)
+	}
+	frags, ok := resp["fragments"].([]any)
+	if !ok || len(frags) != 3 {
+		t.Fatalf("fragments=%v", resp["fragments"])
+	}
+	f0 := frags[0].(map[string]any)
+	if f0["indexStart"] != 0.0 || f0["indexDuration"] != 3072.0 || f0["indexReferencedBytes"] == nil || f0["indexReferencedBytes"] == 0.0 {
+		t.Fatalf("index fields: %v", f0)
+	}
+	if _, present := resp["indexMode"]; present {
+		t.Fatalf("unexpected top-level indexMode field")
+	}
+}
+
+func TestHandlerSidxAcceptsLegacyWithoutIndex(t *testing.T) {
+	// Segments without sidx keep being accepted when index is omitted.
+	body, ct := buildMultipart(t, goodInit(), goodSeg(1, 0), goodSeg(2, 3072))
+	status, resp := post(t, body, ct)
+	if status != http.StatusOK {
+		t.Fatalf("status %d, resp %v", status, resp)
+	}
+	frags := resp["fragments"].([]any)
+	f0 := frags[0].(map[string]any)
+	if _, present := f0["indexStart"]; present {
+		t.Fatalf("legacy response must not contain indexStart: %v", f0)
+	}
+}
+
+func TestHandlerSidxMissing(t *testing.T) {
+	body, ct := buildMultipart(t, goodInit(), goodSidxSeg(1, 0), goodSeg(2, 3072))
+	status, resp := postPath(t, "/api/fmp4/audit?index=sidx", body, ct)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d", status)
+	}
+	e := resp["error"].(map[string]any)
+	if e["code"] != "MISSING_SIDX" || e["segmentIndex"] != 1.0 || e["fragmentIndex"] != 1.0 {
+		t.Fatalf("error: %v", e)
+	}
+}
+
+func TestHandlerSidxBadMode(t *testing.T) {
+	for _, q := range []string{"?index=foo", "?index=SIDX", "?index=sidx2"} {
+		body, ct := buildMultipart(t, goodInit(), goodSeg(1, 0))
+		status, resp := postPath(t, "/api/fmp4/audit"+q, body, ct)
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s: status %d", q, status)
+		}
+		if code := errorCode(t, resp); code != "BAD_INDEX_MODE" {
+			t.Fatalf("%s: code %q", q, code)
+		}
+		e := resp["error"].(map[string]any)
+		if e["segmentIndex"] != -1.0 || e["fragmentIndex"] != -1.0 {
+			t.Fatalf("%s: indices %v/%v", q, e["segmentIndex"], e["fragmentIndex"])
+		}
+	}
+}
+
+func TestHandlerSidxRangeMismatch(t *testing.T) {
+	// Read the honest referenced size, then craft an index claiming 8 fewer.
+	honest := goodSidxSeg(1, 0)
+	var realSize uint32
+	for i := 0; i+8 <= len(honest); i++ {
+		if string(honest[i+4:i+8]) == "sidx" {
+			ref := i + 8 + 20 + 4 // header + sidx fixed fields + ref header byte
+			realSize = uint32(honest[ref+1])<<16 | uint32(honest[ref+2])<<8 | uint32(honest[ref+3])
+			break
+		}
+	}
+	if realSize == 0 {
+		t.Fatal("sidx not found in fixture")
+	}
+	badSize := realSize - 8
+	bad := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: &fixture.SidxOpts{ReferencedSize: &badSize},
+	})
+	body, ct := buildMultipart(t, goodInit(), bad)
+	status, resp := postPath(t, "/api/fmp4/audit?index=sidx", body, ct)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, resp %v", status, resp)
+	}
+	e := resp["error"].(map[string]any)
+	if e["code"] != "SIDX_RANGE_MISMATCH" || e["segmentIndex"] != 0.0 {
+		t.Fatalf("error: %v", e)
+	}
+}
+
+func TestHandlerSidxTimeMismatch(t *testing.T) {
+	earliest := uint32(128)
+	bad := fixture.MediaSegment(fixture.MediaOpts{
+		Seq: 1, BaseTime: 0, Samples: fixture.Samples(3, 1024, 16),
+		Sidx: &fixture.SidxOpts{EarliestTime: &earliest},
+	})
+	body, ct := buildMultipart(t, goodInit(), bad)
+	status, resp := postPath(t, "/api/fmp4/audit?index=sidx", body, ct)
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, resp %v", status, resp)
+	}
+	e := resp["error"].(map[string]any)
+	if e["code"] != "SIDX_TIME_MISMATCH" || e["segmentIndex"] != 0.0 {
+		t.Fatalf("error: %v", e)
 	}
 }

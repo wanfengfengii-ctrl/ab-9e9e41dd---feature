@@ -12,6 +12,7 @@ const (
 	CodeNoMediaSegments  = "NO_MEDIA_SEGMENTS"
 	CodeTooManySegments  = "TOO_MANY_SEGMENTS"
 	CodeMethodNotAllowed = "METHOD_NOT_ALLOWED"
+	CodeBadIndexMode     = "BAD_INDEX_MODE"
 
 	// Box structure (init or media segment).
 	CodeBoxStructureInvalid = "BOX_STRUCTURE_INVALID"
@@ -47,6 +48,16 @@ const (
 	// Decode timeline continuity.
 	CodeTimelineGap     = "TIMELINE_GAP"
 	CodeTimelineOverlap = "TIMELINE_OVERLAP"
+
+	// Segment index (sidx) checks, only enforced with index=sidx.
+	CodeMissingSidx          = "MISSING_SIDX"
+	CodeMultipleSidx         = "MULTIPLE_SIDX"
+	CodeSidxTimescaleInvalid = "SIDX_TIMESCALE_INVALID"
+	CodeSidxReferenceCount   = "SIDX_REFERENCE_COUNT"
+	CodeSidxFirstOffset      = "SIDX_FIRST_OFFSET"
+	CodeSidxRangeMismatch    = "SIDX_RANGE_MISMATCH"
+	CodeSidxDurationMismatch = "SIDX_DURATION_MISMATCH"
+	CodeSidxTimeMismatch     = "SIDX_TIME_MISMATCH"
 )
 
 // AuditError describes a single rejected submission. SegmentIndex is the

@@ -118,6 +118,25 @@ func (c *cursor) u32() (uint32, bool) {
 	return v, true
 }
 
+func (c *cursor) u16() (uint16, bool) {
+	if c.off+2 > len(c.b) {
+		return 0, false
+	}
+	v := binary.BigEndian.Uint16(c.b[c.off:])
+	c.off += 2
+	return v, true
+}
+
+// read fills p from the cursor and reports whether all bytes were available.
+func (c *cursor) read(p []byte) bool {
+	if c.off+len(p) > len(c.b) {
+		return false
+	}
+	copy(p, c.b[c.off:])
+	c.off += len(p)
+	return true
+}
+
 func (c *cursor) u64() (uint64, bool) {
 	if c.off+8 > len(c.b) {
 		return 0, false

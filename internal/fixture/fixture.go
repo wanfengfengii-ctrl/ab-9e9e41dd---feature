@@ -132,6 +132,96 @@ func buildTrak(trackID uint32, handler string, timescale uint32) []byte {
 	return Box("trak", cat(tkhd, mdia))
 }
 
+// SidxOpts configures the top-level sidx box that MediaSegment prepends when
+// MediaOpts.Sidx is set. The zero value of every *uint32 override means
+// "derive the correct value from the segment itself", so an empty SidxOpts
+// produces a valid index; the overrides exist to craft malformed indices.
+type SidxOpts struct {
+	Timescale uint32 // sidx timescale; 0 defaults to 48000
+
+	EarliestTime   *uint32 // override earliest_presentation_time (default: BaseTime)
+	FirstOffset    *uint32 // override first_offset (default: 0)
+	ReferencedSize *uint32 // override referenced_size (default: moof+mdat bytes)
+	Duration       *uint32 // override subsegment_duration (default: sample duration sum)
+
+	ReferenceCount *uint16 // override reference_count (default: one entry)
+	ReferenceType  byte    // override the reference_type byte (default: 0 = media)
+	V1             bool    // emit a version-1 sidx (64-bit earliest time/offset)
+}
+
+// SidxBox builds a version-0 sidx full box with exactly one media reference
+// covering referencedSize bytes and duration ticks.
+func SidxBox(referenceID, timescale, earliestTime, firstOffset, referencedSize, duration uint32) []byte {
+	ref := []byte{
+		0x00, // reference_type = 0 (media reference)
+		byte(referencedSize >> 16), byte(referencedSize >> 8), byte(referencedSize),
+		byte(duration >> 24), byte(duration >> 16), byte(duration >> 8), byte(duration),
+		0x80, 0, 0, 0, // starts_with_SAP=1, SAP_type=0, SAP_delta_time=0
+	}
+	body := cat(
+		be32(referenceID),
+		be32(timescale),
+		be32(earliestTime),
+		be32(firstOffset),
+		[]byte{0, 0, 0, 1}, // reserved(16b)=0, reference_count(16b)=1
+		ref,
+	)
+	return fullBox("sidx", 0, 0, body)
+}
+
+// sidxBoxFor builds the sidx box requested by opts, deriving the honest
+// values from the segment's moof/mdat bytes and sample durations.
+func sidxBoxFor(o SidxOpts, trackID uint32, baseTime uint64, mediaSize, segDuration uint32) []byte {
+	timescale := o.Timescale
+	if timescale == 0 {
+		timescale = 48000
+	}
+	var earliest uint64 = baseTime
+	var firstOff uint64
+	refSize, dur := mediaSize, segDuration
+	if o.EarliestTime != nil {
+		earliest = uint64(*o.EarliestTime)
+	}
+	if o.FirstOffset != nil {
+		firstOff = uint64(*o.FirstOffset)
+	}
+	if o.ReferencedSize != nil {
+		refSize = *o.ReferencedSize
+	}
+	if o.Duration != nil {
+		dur = *o.Duration
+	}
+
+	ref := []byte{
+		o.ReferenceType,
+		byte(refSize >> 16), byte(refSize >> 8), byte(refSize),
+		byte(dur >> 24), byte(dur >> 16), byte(dur >> 8), byte(dur),
+		0x80, 0, 0, 0, // starts_with_SAP=1, SAP_type=0, SAP_delta_time=0
+	}
+	count := uint16(1)
+	if o.ReferenceCount != nil {
+		count = *o.ReferenceCount
+	}
+	var times []byte
+	if o.V1 {
+		times = cat(be64(earliest), be64(firstOff))
+	} else {
+		times = cat(be32(uint32(earliest)), be32(uint32(firstOff)))
+	}
+	body := cat(
+		be32(trackID),
+		be32(timescale),
+		times,
+		[]byte{0, 0, byte(count >> 8), byte(count)},
+		ref,
+	)
+	version := byte(0)
+	if o.V1 {
+		version = 1
+	}
+	return fullBox("sidx", version, 0, body)
+}
+
 // MediaOpts configures MediaSegment.
 type MediaOpts struct {
 	Seq          uint32
@@ -151,6 +241,10 @@ type MediaOpts struct {
 	MdatTruncate  int    // shrink mdat payload by this many bytes
 	DataOffset    *int32 // explicit data_offset for the first trun
 	SecondOverlap uint32 // shift second trun's data_offset back by this many bytes
+
+	// Sidx, when non-nil, prepends a top-level sidx box describing the
+	// following moof/mdat extent. An empty SidxOpts is an honest index.
+	Sidx *SidxOpts
 }
 
 // MediaSegment builds an fMP4 media segment: styp, moof(mfhd, traf(tfhd,
@@ -236,7 +330,22 @@ func MediaSegment(o MediaOpts) []byte {
 	}
 
 	styp := Box("styp", cat([]byte("msdh"), be32(0), []byte("msdhmsix")))
-	return cat(styp, moof, mdat)
+	parts := [][]byte{styp}
+	if o.Sidx != nil {
+		// mediaSize/duration are the honest values; SidxOpts may override them
+		// to craft a mismatching index.
+		mediaSize := uint32(len(moof)) + uint32(len(mdat))
+		var segDur uint32
+		for _, s := range o.Samples {
+			segDur += s.Dur
+		}
+		for _, s := range o.SecondTrun {
+			segDur += s.Dur
+		}
+		parts = append(parts, sidxBoxFor(*o.Sidx, o.TrackID, o.BaseTime, mediaSize, segDur))
+	}
+	parts = append(parts, moof, mdat)
+	return cat(parts...)
 }
 
 func totalSize(samples []Sample) int {

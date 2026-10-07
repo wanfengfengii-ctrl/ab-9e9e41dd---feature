@@ -16,6 +16,10 @@ const (
 )
 
 // FragmentReport describes one audited movie fragment (moof) in decode order.
+//
+// The index fields (IndexStart/IndexDuration/IndexReferencedBytes) are only
+// populated when the audit requested sidx verification; they stay nil in the
+// legacy mode so the response shape is unchanged.
 type FragmentReport struct {
 	Index          int    `json:"index"`
 	SegmentIndex   int    `json:"segmentIndex"`
@@ -24,6 +28,10 @@ type FragmentReport struct {
 	End            uint64 `json:"end"`
 	Duration       uint64 `json:"duration"`
 	Samples        uint32 `json:"samples"`
+
+	IndexStart           *uint64 `json:"indexStart,omitempty"`
+	IndexDuration        *uint64 `json:"indexDuration,omitempty"`
+	IndexReferencedBytes *uint64 `json:"indexReferencedBytes,omitempty"`
 }
 
 // Report is the result of a successful audit.
@@ -33,6 +41,13 @@ type Report struct {
 	FragmentCount int
 	TotalDuration uint64
 	Fragments     []FragmentReport
+}
+
+// Options tunes AuditWithOptions. RequireSIDX additionally enforces that every
+// media segment carries one top-level sidx whose timescale, reference range
+// and timing exactly describe the following moof/mdat bytes.
+type Options struct {
+	RequireSIDX bool
 }
 
 // initTrack carries the per-track facts recovered from the init segment.
@@ -50,20 +65,28 @@ type fragment struct {
 	start        uint64
 	duration     uint64
 	samples      uint32
+	// sidx metadata, only populated when Options.RequireSIDX is set.
+	indexStart           uint64
+	indexDuration        uint64
+	indexReferencedBytes uint64
 }
 
 // Audit validates one initialization segment followed by one or more media
 // segments and returns the reconstructed decode timeline. Any violation is
 // reported as a single *AuditError with a stable code.
 func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
+	return AuditWithOptions(initBuf, segs, Options{})
+}
+
+// AuditWithOptions is Audit with explicit options.
+func AuditWithOptions(initBuf []byte, segs [][]byte, opts Options) (*Report, *AuditError) {
 	init, aerr := parseInit(initBuf)
 	if aerr != nil {
 		return nil, aerr
 	}
-
 	var frags []fragment
 	for i, seg := range segs {
-		fs, aerr := parseMediaSegment(seg, i, init, len(frags))
+		fs, aerr := parseMediaSegment(seg, i, init, len(frags), opts)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -97,7 +120,7 @@ func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
 		FragmentCount: len(frags),
 	}
 	for i, f := range frags {
-		rep.Fragments = append(rep.Fragments, FragmentReport{
+		fr := FragmentReport{
 			Index:          i,
 			SegmentIndex:   f.segmentIndex,
 			SequenceNumber: f.seq,
@@ -105,7 +128,15 @@ func Audit(initBuf []byte, segs [][]byte) (*Report, *AuditError) {
 			End:            f.start + f.duration,
 			Duration:       f.duration,
 			Samples:        f.samples,
-		})
+		}
+		// The sidx describes a whole media part; attach its summary only to
+		// the part's first fragment (parts usually have one moof anyway).
+		firstOfPart := i == 0 || frags[i-1].segmentIndex != f.segmentIndex
+		if opts.RequireSIDX && firstOfPart {
+			s, d, n := f.indexStart, f.indexDuration, f.indexReferencedBytes
+			fr.IndexStart, fr.IndexDuration, fr.IndexReferencedBytes = &s, &d, &n
+		}
+		rep.Fragments = append(rep.Fragments, fr)
 	}
 	if len(frags) > 0 {
 		first, last := frags[0], frags[len(frags)-1]
@@ -296,7 +327,7 @@ func parseTrex(b *box) (trackID, defDur, defSize uint32, aerr *AuditError) {
 // init segment's track, resolve all sample parameters, and reference payload
 // bytes that exist inside the segment's mdat box(es). fragBase is the global
 // fragment index of the segment's first moof.
-func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([]fragment, *AuditError) {
+func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int, opts Options) ([]fragment, *AuditError) {
 	tops, aerr := parseBoxes(buf, 0, segIdx, fragBase)
 	if aerr != nil {
 		return nil, aerr
@@ -323,6 +354,11 @@ func parseMediaSegment(buf []byte, segIdx int, init *initTrack, fragBase int) ([
 	// overlap, and the mdat payload bytes must be fully consumed.
 	if aerr := checkPayload(ranges, mdats, segIdx); aerr != nil {
 		return nil, aerr
+	}
+	if opts.RequireSIDX {
+		if aerr := checkSIDX(tops, init, frags, segIdx, fragBase); aerr != nil {
+			return nil, aerr
+		}
 	}
 	return frags, nil
 }

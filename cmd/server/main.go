@@ -9,6 +9,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"mime"
@@ -112,6 +113,21 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var opts fmp4.Options
+	switch mode := r.URL.Query().Get("index"); mode {
+	case "":
+		// Legacy timeline-only audit.
+	case "sidx":
+		opts.RequireSIDX = true
+	default:
+		writeError(w, http.StatusBadRequest, &fmp4.AuditError{
+			Code:         fmp4.CodeBadIndexMode,
+			Message:      fmt.Sprintf("unsupported index mode %q, allowed values: sidx", mode),
+			SegmentIndex: -1, FragmentIndex: -1,
+		})
+		return
+	}
+
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
 		writeError(w, http.StatusBadRequest, &fmp4.AuditError{
@@ -188,7 +204,7 @@ func handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rep, aerr := fmp4.Audit(init, segs)
+	rep, aerr := fmp4.AuditWithOptions(init, segs, opts)
 	if aerr != nil {
 		writeError(w, http.StatusUnprocessableEntity, aerr)
 		return
